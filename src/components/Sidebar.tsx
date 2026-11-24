@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { BarChart3, Building2, Database, PiggyBank, Plus, TriangleAlert, X } from 'lucide-react'
+import { BarChart3, Building2, Database, PiggyBank, Plus, TriangleAlert, Users, X } from 'lucide-react'
 import { db } from '../db'
 import { hrefFor, type Route } from '../lib/router'
 import { cx } from './ui'
@@ -92,6 +92,9 @@ export function Sidebar({
           </div>
 
           <div className="mt-6 pt-4 border-t border-white/10 space-y-0.5">
+            <a href={hrefFor({ page: 'members' })} onClick={onClose} className={link(route.page === 'members' || route.page === 'member')}>
+              <Users size={18} /> Members
+            </a>
             <a href={hrefFor({ page: 'reports' })} onClick={onClose} className={link(route.page === 'reports')}>
               <BarChart3 size={18} /> Reports
             </a>

@@ -9,6 +9,8 @@ import { GroupDialog } from './components/dialogs'
 import { SaversPage } from './pages/SaversPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { BackupPage } from './pages/BackupPage'
+import { MemberProfilePage } from './pages/MemberProfilePage'
+import { MembersPage } from './pages/MembersPage'
 
 export default function App() {
   const route = useRoute()
@@ -55,6 +57,8 @@ export default function App() {
         <main className="flex-1 min-w-0">
           {route.page === 'reports' && <ReportsPage />}
           {route.page === 'backup' && <BackupPage />}
+          {route.page === 'members' && <MembersPage />}
+          {route.page === 'member' && <MemberProfilePage key={route.id} id={route.id} />}
           {route.page === 'savers' &&
             (activeGroup ? (
               <SaversPage key={activeGroup.id} group={activeGroup} />

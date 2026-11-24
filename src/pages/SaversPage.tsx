@@ -21,7 +21,7 @@ import { addDays, formatLongDate, formatPeso, formatRange, fromISODate, today, w
 import { downloadFile, toCSV } from '../lib/csv'
 import { navigate } from '../lib/router'
 import { Button, ConfirmDialog, StatCard, cx, inputClass, selectClass, useToast } from '../components/ui'
-import { GroupDialog, MemberDialog, MemberHistoryDialog } from '../components/dialogs'
+import { GroupDialog, MemberDialog } from '../components/dialogs'
 import UploadMembersDialog from '../components/UploadMembersDialog'
 import { AmountCell } from '../components/AmountCell'
 import { SheetImagePanel } from '../components/SheetImagePanel'
@@ -62,7 +62,6 @@ export function SaversPage({ group }: { group: Group }) {
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<Sort>('sheet')
   const [memberDialog, setMemberDialog] = useState<{ open: boolean; member: Member | null }>({ open: false, member: null })
-  const [history, setHistory] = useState<Member | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [confirm, setConfirm] = useState<null | { title: string; message: React.ReactNode; label: string; run: () => Promise<unknown> }>(null)
@@ -354,7 +353,7 @@ export function SaversPage({ group }: { group: Group }) {
           onChannel={setWeekChannel}
           containerRef={tableRef}
           focusCell={focusCell}
-          onHistory={setHistory}
+          onHistory={(m) => navigate({ page: 'member', id: m.id! })}
           onPickDay={(d) => {
             setDate(d)
             setMode('day')
@@ -395,7 +394,7 @@ export function SaversPage({ group }: { group: Group }) {
             row={r}
             date={date}
             focusCell={focusCell}
-            onHistory={() => setHistory(r.member)}
+            onHistory={() => navigate({ page: 'member', id: r.member.id! })}
             onEdit={() => setMemberDialog({ open: true, member: r.member })}
             onDelete={() =>
               setConfirm({
@@ -456,7 +455,6 @@ export function SaversPage({ group }: { group: Group }) {
       )}
 
       <MemberDialog open={memberDialog.open} groupId={groupId} member={memberDialog.member} onClose={() => setMemberDialog({ open: false, member: null })} />
-      <MemberHistoryDialog member={history} onClose={() => setHistory(null)} />
       <GroupDialog open={renameOpen} group={group} onClose={() => setRenameOpen(false)} />
       <UploadMembersDialog
         open={uploadOpen}

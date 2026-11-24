@@ -115,6 +115,40 @@ export async function deleteMember(id: number) {
   })
 }
 
+/**
+ * Folds a duplicate member into another: their payments and ticks move to `intoId`,
+ * then the duplicate is deleted. If both have a payment on the same date and channel,
+ * the larger amount is kept (a duplicate usually comes from importing the same sheet twice).
+ */
+export async function mergeMembers(fromId: number, intoId: number) {
+  if (fromId === intoId) return { moved: 0 }
+  return db.transaction('rw', db.members, db.payments, db.checks, async () => {
+    const into = await db.members.get(intoId)
+    if (!into || !(await db.members.get(fromId))) throw new Error('Member not found')
+    const theirs = await db.payments.where('memberId').equals(fromId).toArray()
+    const mine = await db.payments.where('memberId').equals(intoId).toArray()
+    const key = (p: Payment) => `${p.date}|${p.channel}`
+    const existing = new Map(mine.map((p) => [key(p), p]))
+    let moved = 0
+    for (const p of theirs) {
+      const clash = existing.get(key(p))
+      if (clash) {
+        if (p.amount > clash.amount) await db.payments.update(clash.id!, { amount: p.amount, referenceNumber: p.referenceNumber || clash.referenceNumber })
+        await db.payments.delete(p.id!)
+      } else {
+        await db.payments.update(p.id!, { memberId: intoId, groupId: into.groupId })
+        moved++
+      }
+    }
+    for (const c of await db.checks.where('memberId').equals(fromId).toArray()) {
+      await db.checks.delete([fromId, c.date])
+      await db.checks.put({ ...c, memberId: intoId, groupId: into.groupId })
+    }
+    await db.members.delete(fromId)
+    return { moved }
+  })
+}
+
 // ---------- Payments ----------
 
 /** Creates, updates or (amount <= 0) removes the member's payment for that date and channel. */

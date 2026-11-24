@@ -6,7 +6,7 @@ import { sumByChannel } from '../lib/data'
 import { addDays, addMonths, formatDayDate, formatPeso, formatRange, monthRange, today, weekRange } from '../lib/format'
 import { downloadFile, toCSV } from '../lib/csv'
 import { Button, StatCard, cx, selectClass } from '../components/ui'
-import { MemberHistoryDialog } from '../components/dialogs'
+import { navigate } from '../lib/router'
 
 type Period = 'week' | 'month' | 'custom'
 
@@ -16,7 +16,6 @@ export function ReportsPage() {
   const [anchor, setAnchor] = useState(today())
   const [custom, setCustom] = useState<[string, string]>(() => monthRange(today()))
   const [memberSort, setMemberSort] = useState<'total' | 'name' | 'days'>('total')
-  const [history, setHistory] = useState<Member | null>(null)
 
   const [start, end] = period === 'week' ? weekRange(anchor) : period === 'month' ? monthRange(anchor) : custom
   const step = (dir: 1 | -1) => setAnchor(period === 'week' ? addDays(anchor, 7 * dir) : addMonths(anchor, dir))
@@ -208,7 +207,7 @@ export function ReportsPage() {
                 </thead>
                 <tbody>
                   {perMember.map((r) => (
-                    <tr key={r.member.id} className="border-t border-slate-50 hover:bg-slate-50 cursor-pointer" onClick={() => setHistory(r.member)}>
+                    <tr key={r.member.id} className="border-t border-slate-50 hover:bg-slate-50 cursor-pointer" onClick={() => navigate({ page: 'member', id: r.member.id! })}>
                       <td className="px-4 py-2">
                         <div className="font-medium text-slate-800">{r.member.name}</div>
                         <div className="font-mono text-xs text-slate-500">{r.member.cid}</div>
@@ -228,7 +227,6 @@ export function ReportsPage() {
         </section>
       </div>
 
-      <MemberHistoryDialog member={history} onClose={() => setHistory(null)} />
     </div>
   )
 }

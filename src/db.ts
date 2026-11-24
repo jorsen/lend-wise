@@ -86,6 +86,10 @@ export async function setChecked(memberId: number, groupId: number, date: string
 }
 
 export interface SheetRow {
+  /** Existing member chosen in the review step (omit to look up by CID / add new) */
+  memberId?: number;
+  /** true when memberId came from a fuzzy match: the stored name/CID are left untouched */
+  fuzzy?: boolean;
   cid: string;
   name: string;
   cash: number;
@@ -96,7 +100,9 @@ export interface SheetRow {
 
 /**
  * Saves rows from an uploaded sheet (CSV/Excel/OCR) into one group on one date.
- * - Members are matched by CID within the group; new ones are appended.
+ * - A row with `memberId` goes to that member. An exact match may refresh the stored name;
+ *   a fuzzy match (`fuzzy`) never overwrites the stored name or CID.
+ * - Otherwise members are matched by CID within the group; new ones are appended.
  * - For each channel with a non-zero amount, that member/date/channel payment is replaced.
  * - A zero amount leaves existing payments for that channel untouched.
  */
@@ -107,9 +113,12 @@ export async function importSheetRows(groupId: number, date: string, rows: Sheet
     let nextOrder = existing.reduce((m, x) => Math.max(m, x.order), -1) + 1;
 
     for (const r of rows) {
-      let member = await db.members.where('[groupId+cid]').equals([groupId, r.cid]).first();
+      let member = r.memberId != null
+        ? await db.members.get(r.memberId)
+        : await db.members.where('[groupId+cid]').equals([groupId, r.cid]).first();
+      if (member && member.groupId !== groupId) member = undefined; // safety: never cross groups
       if (member) {
-        if (r.name && r.name !== member.name) await db.members.update(member.id!, { name: r.name });
+        if (!r.fuzzy && r.name && r.name !== member.name) await db.members.update(member.id!, { name: r.name });
         updated++;
       } else {
         const id = await db.members.add({ groupId, cid: r.cid, name: r.name, order: nextOrder++ });

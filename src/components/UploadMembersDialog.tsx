@@ -7,6 +7,7 @@ import { db, importSheetRows, replaceSheetImages } from '../db';
 import { AMOUNT_LABELS, normalizeName, parseAmount, type AmountField, type ImportRow } from '../lib/importTypes';
 import { parseSpreadsheet } from '../lib/parseSpreadsheet';
 import Magnifier from './Magnifier';
+import { matchSheet } from '../lib/memberMatch';
 import {
   ocrMemberSheet, ocrWithLocalService, OcrServiceUnavailable, prepareForService, preprocessImage, type OcrProgress, type OcrResult,
 } from '../lib/ocr';
@@ -231,40 +232,53 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
     }
   }
 
-  /** Cross-check against members already saved: fix CIDs by name match, flag duplicates. */
+  /**
+   * Links every row to an existing member of the group when it's the same person, even if
+   * OCR misread the CID or name (exact CID -> CID 1 digit off + similar name -> similar name).
+   * The user can change the link in the review table.
+   */
   function finalize(list: ImportRow[]): ImportRow[] {
-    const byCid = new Map(existing.map((m) => [m.cid, m]));
-    const byName = new Map(existing.map((m) => [normalizeName(m.name), m]));
-    return list.map((r) => {
-      const notes = [...r.notes];
-      let { cid, name } = r;
-      const nameKey = normalizeName(name);
-      if (!byCid.has(cid) && nameKey && byName.has(nameKey)) {
-        const m = byName.get(nameKey)!;
-        notes.push(`CID corrected ${cid || '(blank)'} → ${m.cid} (name match)`);
-        cid = m.cid;
+    const matches = matchSheet(list, existing);
+    const words = (n: string) => n.trim().split(/[\s.]+/).filter(Boolean).length;
+    return list.map((r, i) => {
+      const m = matches[i];
+      if (!m) return { ...r, matchId: null, matchKind: undefined, matchReason: 'No saved member matches' };
+      let name = r.name;
+      // Exact CID: same letters but better word spacing wins ("ARAHL JERAO" -> "ARAH L. JERAO")
+      if (m.kind === 'cid' && (!name || (normalizeName(name) === normalizeName(m.member.name) && words(m.member.name) >= words(name)))) {
+        name = m.member.name;
       }
-      const saved = byCid.get(cid);
-      // OCR often drops spaces ("BENILDAV.MARQUEZ"); prefer the saved spelling when only spacing differs
-      if (saved && (!name || normalizeName(name) === normalizeName(saved.name))) name = saved.name;
-      return { ...r, cid, name, notes };
+      return { ...r, name, matchId: m.member.id!, matchKind: m.kind, matchReason: m.reason };
     });
   }
+
+  const memberById = useMemo(() => new Map(existing.map((m) => [m.id!, m])), [existing]);
+  const membersSorted = useMemo(() => [...existing].sort((a, b) => a.name.localeCompare(b.name)), [existing]);
 
   const status = useMemo(() => {
     if (!rows) return new Map<string, { label: string; tone: 'new' | 'update' | 'error' }>();
     const byCid = new Map(existing.map((m) => [m.cid, m]));
-    const seen = new Map<string, number>();
-    rows.forEach((r) => r.include && seen.set(r.cid, (seen.get(r.cid) ?? 0) + 1));
+    const memberUses = new Map<number, number>();
+    const newCids = new Map<string, number>();
+    rows.forEach((r) => {
+      if (!r.include) return;
+      if (r.matchId != null) memberUses.set(r.matchId, (memberUses.get(r.matchId) ?? 0) + 1);
+      else newCids.set(r.cid, (newCids.get(r.cid) ?? 0) + 1);
+    });
+    const badAmount = (r: ImportRow) =>
+      (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).some((f) => parseAmount(r[f]) == null);
     return new Map(
       rows.map((r) => {
         let s: { label: string; tone: 'new' | 'update' | 'error' };
-        if (!/^\d{4,}$/.test(r.cid)) s = { label: 'Invalid CID', tone: 'error' };
-        else if (!r.name.trim() && !byCid.has(r.cid)) s = { label: 'Missing name', tone: 'error' };
-        else if ((seen.get(r.cid) ?? 0) > 1 && r.include) s = { label: 'Duplicate CID', tone: 'error' };
-        else if ((['amountPaid', 'clientInitiated', 'agentAssisted'] as const).some((f) => parseAmount(r[f]) == null))
-          s = { label: 'Bad amount', tone: 'error' };
-        else if (byCid.has(r.cid)) s = { label: 'Update', tone: 'update' };
+        if (r.matchId != null) {
+          if (r.include && (memberUses.get(r.matchId) ?? 0) > 1) s = { label: 'Same member twice', tone: 'error' };
+          else if (badAmount(r)) s = { label: 'Bad amount', tone: 'error' };
+          else s = { label: r.matchKind === 'cid' ? 'Update' : 'Matched', tone: 'update' };
+        } else if (!/^\d{4,}$/.test(r.cid)) s = { label: 'Invalid CID', tone: 'error' };
+        else if (!r.name.trim()) s = { label: 'Missing name', tone: 'error' };
+        else if (byCid.has(r.cid)) s = { label: 'CID already used', tone: 'error' };
+        else if (r.include && (newCids.get(r.cid) ?? 0) > 1) s = { label: 'Duplicate CID', tone: 'error' };
+        else if (badAmount(r)) s = { label: 'Bad amount', tone: 'error' };
         else s = { label: 'New', tone: 'new' };
         return [r.key, s];
       }),
@@ -299,6 +313,9 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
         groupId,
         date,
         included.map((r) => ({
+          memberId: r.matchId ?? undefined,
+          // only an exact-CID link may refresh the stored name; fuzzy/manual links never overwrite it
+          fuzzy: r.matchId != null && r.matchKind !== 'cid',
           cid: r.cid,
           name: r.name.trim().toUpperCase(),
           cash: parseAmount(r.amountPaid) ?? 0,
@@ -478,6 +495,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                         <th className="p-2">#</th>
                         <th className="p-2">CID</th>
                         <th className="p-2">Member Name</th>
+                        <th className="p-2">Saved member</th>
                         {([['amountPaid', 'Cash'], ['clientInitiated', 'Client Init.'], ['agentAssisted', 'Agent Asst.']] as const).map(([f, label]) => (
                           <th key={f} className="p-2">
                             <div className="flex items-center gap-1">
@@ -509,6 +527,35 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                             <td className="p-2 text-slate-400">{i + 1}</td>
                             <td className="p-1"><input className={`${cell} !w-28 min-w-28 font-mono`} value={r.cid} onChange={(e) => update(r.key, { cid: e.target.value.replace(/\D/g, '') })} /></td>
                             <td className="p-1"><input className={`${cell} min-w-44`} value={r.name} onChange={(e) => update(r.key, { name: e.target.value })} /></td>
+                            <td className="p-1">
+                              <select
+                                className={`max-w-56 rounded border px-1.5 py-1 text-xs ${r.matchId != null ? (r.matchKind === 'cid' ? 'border-blue-200 bg-blue-50 text-blue-800' : 'border-amber-300 bg-amber-50 text-amber-900') : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}
+                                value={r.matchId ?? 'new'}
+                                title={r.matchReason}
+                                onChange={(e) => {
+                                  const v = e.target.value;
+                                  if (v === 'new') return update(r.key, { matchId: null, matchKind: undefined, matchReason: 'Will be added as a new member' });
+                                  const m = memberById.get(Number(v));
+                                  update(r.key, {
+                                    matchId: Number(v),
+                                    matchKind: m && m.cid === r.cid ? 'cid' : 'manual',
+                                    matchReason: 'Chosen by hand',
+                                  });
+                                }}
+                              >
+                                <option value="new">New member</option>
+                                {membersSorted.map((m) => (
+                                  <option key={m.id} value={m.id}>
+                                    Existing: {m.name} ({m.cid})
+                                  </option>
+                                ))}
+                              </select>
+                              {r.matchId != null && r.matchKind !== 'cid' && (
+                                <div className="mt-0.5 max-w-56 truncate text-[11px] text-amber-700" title={r.matchReason}>
+                                  {r.matchReason}
+                                </div>
+                              )}
+                            </td>
                             <td className="p-1">{amt('amountPaid')}</td>
                             <td className="p-1">{amt('clientInitiated')}</td>
                             <td className="p-1">{amt('agentAssisted')}</td>
@@ -526,7 +573,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                     </tbody>
                     <tfoot className="border-t-2 border-slate-200 bg-slate-50 font-semibold">
                       <tr>
-                        <td colSpan={4} className="p-2 text-right">Total ({included.length} rows)</td>
+                        <td colSpan={5} className="p-2 text-right">Total ({included.length} rows)</td>
                         <td className="p-2 text-right">{totals.amountPaid.toLocaleString()}</td>
                         <td className="p-2 text-right">{totals.clientInitiated.toLocaleString()}</td>
                         <td className="p-2 text-right">{totals.agentAssisted.toLocaleString()}</td>

@@ -22,6 +22,11 @@ export interface ImportRow {
   notes: string[];
   /** Which image page the row came from (OCR only) */
   source?: string;
+  /** Existing member this row is for (null = new member). Set in the review step. */
+  matchId?: number | null;
+  /** how matchId was chosen: exact CID, fuzzy CID/name, or picked by hand */
+  matchKind?: 'cid' | 'cid-fuzzy' | 'name' | 'manual';
+  matchReason?: string;
 }
 
 let counter = 0;

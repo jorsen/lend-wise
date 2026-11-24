@@ -112,6 +112,69 @@ def fix_name(name: str) -> str:
     return s
 
 
+def normalize_names(rows: list[dict]) -> None:
+    """
+    Puts names in 'FIRST M. LAST' form using what the rest of the sheet shows:
+      * surnames seen on other rows split glued words ('LERIZAASALAGUBANG' -> 'LERIZAA SALAGUBANG')
+      * when most names have a middle initial, a 2-word name gets its glued initial split off
+        ('CESARIAE MARQUEZ' -> 'CESARIA E. MARQUEZ', 'ARAHL JERAO' -> 'ARAH L. JERAO')
+      * single letters become initials with a dot ('JORSEN B MEJIA' -> 'JORSEN B. MEJIA')
+    Guessed splits add a note so they can be checked in the review table.
+    """
+    def toks(n):
+        return [t for t in re.split(r"[\s.]+", n) if t]
+
+    surnames: dict[str, int] = {}
+    with_mi = 0
+    for r in rows:
+        t = toks(r["name"])
+        if len(t) >= 2 and len(t[-1]) >= 4:
+            surnames[t[-1]] = surnames.get(t[-1], 0) + 1
+        if len(t) >= 3 and any(len(x) == 1 for x in t[1:-1]):
+            with_mi += 1
+    named = sum(1 for r in rows if r["name"])
+    mi_convention = named >= 5 and with_mi >= named * 0.6
+
+    for r in rows:
+        if not r["name"]:
+            continue
+        t = toks(r["name"])
+        guessed = False
+        # split a known surname off the end of a glued word
+        if t:
+            last = t[-1]
+            for sn in sorted(surnames, key=len, reverse=True):
+                # an initial glued to a surname seen elsewhere: 'VMARQUEZ' -> 'V' + 'MARQUEZ'
+                if len(t) >= 2 and last != sn and last.endswith(sn) and len(last) - len(sn) == 1:
+                    t = t[:-1] + [last[0], sn]
+                    guessed = True
+                    break
+        # one glued word with no space at all: try a known surname inside it
+        if len(t) == 1:
+            w = t[0]
+            for sn in sorted(surnames, key=len, reverse=True):
+                if w.endswith(sn) and len(w) - len(sn) >= 3:
+                    t = [w[: -len(sn)], sn]
+                    guessed = True
+                    break
+        # middle initial glued to the first name
+        # 'DE CHAVEZ', 'DELA CRUZ' ... count as one surname
+        core = list(t)
+        while len(core) >= 3 and core[-2] in {"DE", "DEL", "DELA", "DELOS", "DELAS", "SAN", "STA", "STO", "DI", "DA"}:
+            core = core[:-2] + [core[-2] + " " + core[-1]]
+        if mi_convention and len(core) == 2 and len(core[0]) >= 4 and len(core[1]) > 1:
+            t = [core[0][:-1], core[0][-1]] + core[1].split(" ")
+            guessed = True
+        out = []
+        for i, x in enumerate(t):
+            out.append(x + "." if len(x) == 1 and 0 < i < len(t) - 1 else x)
+        name = " ".join(out)
+        if name != r["name"]:
+            r["name"] = name
+            if guessed:
+                r["notes"].append("Name spacing guessed - please check")
+
+
 # --------------------------------------------------------------------------- #
 # Ruling-line tracking
 # --------------------------------------------------------------------------- #
@@ -214,11 +277,90 @@ def band_of(x: float, y: float, line_model) -> float:
 # Main table extraction
 # --------------------------------------------------------------------------- #
 
-def box_info(box, text, score):
+# Short words that really occur in Filipino names; any other 2-3 letter piece made by a
+# gap split ("DO MINGA", "SA MARITA") is a false split and gets joined back.
+SHORT_NAME_WORDS = {
+    "DE", "DEL", "DELA", "DI", "DA", "DOS", "MA", "STA", "STO", "SAN", "LA", "LOS", "VON", "VAN",
+    "GO", "SY", "UY", "CO", "YU", "NG", "ONG", "LIM", "TAN", "LEE", "DY", "TY", "CHU", "LI", "OH", "LU",
+    "JR", "SR", "II", "III", "IV",
+}
+
+
+def spaced_text(text: str, char_boxes, chars) -> str:
+    """
+    Re-inserts spaces the recogniser dropped, using the gaps between character boxes.
+      * strong gaps always split ('PLACEDOVMARQUEZ' -> 'PLACEDO VMARQUEZ')
+      * weak gaps split only while the name still lacks parts (< 3 words) and only into
+        whole words or a single initial ('MARIBELVPADAYAO' -> 'MARIBEL V PADAYAO')
+      * splits that leave a stray 2-3 letter piece ('DO MINGA') or a trailing letter are undone
+    """
+    if not char_boxes or not chars or len(char_boxes) != len(chars):
+        return text
+    spans = [(min(p[0] for p in b), max(p[0] for p in b)) for b in char_boxes]
+    widths = [b - a for (a, b), c in zip(spans, chars) if c.strip()]
+    if not widths:
+        return text
+    cw = float(np.median(widths))
+    strong, weak = max(4.0, cw * 0.45), max(3.0, cw * 0.33)
+
+    # words from real spaces, each with the gap before every character
+    words: list[list[tuple[str, float]]] = [[]]
+    for i, c in enumerate(chars):
+        if not c.strip() or c in ".,":  # a dot separates words too ('S.PATAL')
+            if words[-1]:
+                words.append([])
+            continue
+        gap = spans[i][0] - spans[i - 1][1] if (i > 0 and chars[i - 1].strip() and chars[i - 1] not in ".,") else 0.0
+        words[-1].append((c, gap if words[-1] else 0.0))
+    words = [w for w in words if w]
+
+    def letters(w):
+        return re.sub(r"[^A-ZÑ]", "", "".join(c for c, _ in w).upper())
+
+    def ok_piece(w):
+        n = letters(w)
+        return len(n) == 1 or len(n) >= 4 or n in SHORT_NAME_WORDS
+
+    def split_at(threshold, limit):
+        nonlocal words
+        changed = True
+        while changed and len(words) < limit:
+            changed = False
+            best = None
+            for wi, w in enumerate(words):
+                for ci in range(1, len(w)):
+                    g = w[ci][1]
+                    if g >= threshold and ok_piece(w[:ci]) and ok_piece(w[ci:]):
+                        if best is None or g > best[0]:
+                            best = (g, wi, ci)
+            if best:
+                _, wi, ci = best
+                w = words[wi]
+                words = words[:wi] + [w[:ci], [(w[ci][0], 0.0)] + w[ci + 1:]] + words[wi + 1:]
+                changed = True
+
+    split_at(strong, 99)
+    if len(words) == 1:  # fully glued name: also trust weaker gaps
+        split_at(weak, 3)
+
+    out = [letters(w) if letters(w) else "".join(c for c, _ in w) for w in words]
+    # a single letter can't end a name, and two single letters in a row are one word
+    merged: list[str] = []
+    for i, w in enumerate(out):
+        if merged and len(w) == 1 and (i == len(out) - 1 or len(merged[-1]) == 1):
+            merged[-1] += w
+        else:
+            merged.append(w)
+    # keep the punctuation of the original (dots after initials are re-added later)
+    return " ".join(merged)
+
+
+def box_info(box, text, score, char_boxes=None, chars=None):
     xs = [p[0] for p in box]
     ys = [p[1] for p in box]
     return {
         "text": str(text).strip(),
+        "spaced": spaced_text(str(text).strip(), char_boxes, chars) if chars else str(text).strip(),
         "conf": float(score),
         "x0": float(min(xs)), "x1": float(max(xs)),
         "y0": float(min(ys)), "y1": float(max(ys)),
@@ -247,8 +389,11 @@ def extract(img: np.ndarray) -> dict:
     t0 = time.time()
     with engine_lock:
         # slightly lower thresholds than the defaults pick up more faint handwriting
-        res, _ = engine(img, box_thresh=0.3, text_score=0.3)
-    words = [box_info(b, t, s) for b, t, s in (res or []) if str(t).strip()]
+        res, _ = engine(img, box_thresh=0.3, text_score=0.3, return_word_box=True)
+    words = [
+        box_info(r_[0], r_[1], r_[2], r_[3] if len(r_) > 4 else None, r_[4] if len(r_) > 4 else None)
+        for r_ in (res or []) if str(r_[1]).strip()
+    ]
 
     # --- CIDs ---------------------------------------------------------------
     anchors = []
@@ -456,7 +601,7 @@ def extract(img: np.ndarray) -> dict:
     for k in sorted(rows):
         r = rows[k]
         parts = sorted(r["nameParts"], key=lambda p: p["x0"])
-        name = fix_name(" ".join(p["text"] for p in parts))
+        name = fix_name(" ".join(p.get("spaced", p["text"]) for p in parts))
         confs = [r["cidConf"]] + [p["conf"] for p in parts]
         notes = []
         row = {"cid": r["cid"], "name": name, "amountPaid": "", "clientInitiated": "", "agentAssisted": "",
@@ -490,6 +635,7 @@ def extract(img: np.ndarray) -> dict:
         row["notes"] = notes
         out_rows.append(row)
 
+    normalize_names(out_rows)
     return {
         "rows": out_rows,
         "columnsDetected": columns_detected,

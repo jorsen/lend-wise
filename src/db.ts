@@ -27,10 +27,31 @@ export interface Payment {
   referenceNumber: string;
 }
 
+/** The Status tick on the Savers sheet: set by hand per member per day (unticked by default). */
+export interface DayCheck {
+  memberId: number;
+  groupId: number;
+  date: string; // YYYY-MM-DD
+  checked: boolean;
+}
+
+/** A photo of the paper sheet uploaded for a group and day (shown beside the Day sheet). */
+export interface SheetImage {
+  id?: number;
+  groupId: number;
+  date: string; // YYYY-MM-DD
+  blob: Blob;
+  name: string;
+  rotation: number; // degrees still to apply when displaying (uploads are stored upright: 0)
+  uploadedAt: number;
+}
+
 export const db = new Dexie('lendwise') as Dexie & {
   groups: EntityTable<Group, 'id'>;
   members: EntityTable<Member, 'id'>;
   payments: EntityTable<Payment, 'id'>;
+  checks: Dexie.Table<DayCheck, [number, string]>;
+  sheetImages: EntityTable<SheetImage, 'id'>;
 };
 
 db.version(1).stores({
@@ -38,6 +59,31 @@ db.version(1).stores({
   members: '++id, groupId, cid, [groupId+cid], order',
   payments: '++id, groupId, memberId, date, [groupId+date], [memberId+date]',
 });
+db.version(2).stores({
+  checks: '[memberId+date], groupId, date, memberId, [groupId+date]',
+});
+db.version(3).stores({
+  sheetImages: '++id, [groupId+date], groupId, date',
+});
+
+/** Replaces the stored sheet photos for a group and day. */
+export async function replaceSheetImages(
+  groupId: number,
+  date: string,
+  images: { blob: Blob; name: string }[],
+) {
+  await db.transaction('rw', db.sheetImages, async () => {
+    await db.sheetImages.where('[groupId+date]').equals([groupId, date]).delete();
+    const now = Date.now();
+    await db.sheetImages.bulkAdd(images.map((im) => ({ groupId, date, blob: im.blob, name: im.name, rotation: 0, uploadedAt: now })));
+  });
+}
+
+/** Ticks / unticks a member's Status for a day. Unticking removes the record (default = unticked). */
+export async function setChecked(memberId: number, groupId: number, date: string, checked: boolean) {
+  if (checked) await db.checks.put({ memberId, groupId, date, checked: true });
+  else await db.checks.delete([memberId, date]);
+}
 
 export interface SheetRow {
   cid: string;

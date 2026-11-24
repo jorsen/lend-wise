@@ -529,13 +529,18 @@ export async function terminateOcr() {
 /* Accurate OCR: local RapidOCR service (ocr-server/server.py)         */
 /* ------------------------------------------------------------------ */
 
-/** Applies EXIF orientation + rotation and returns a colour JPEG (long side ≤ 3200px) plus a preview URL. */
-export async function prepareForService(file: File, rotation = 0): Promise<{ blob: Blob; preview: string }> {
+/** Applies EXIF orientation + rotation and returns an upright colour JPEG (long side ≤ maxSide) plus a preview URL. */
+export async function prepareForService(
+  file: File,
+  rotation = 0,
+  maxSide = 3200,
+  quality = 0.95,
+): Promise<{ blob: Blob; preview: string }> {
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
   const rotated = rotation % 180 !== 0;
   const srcW = rotated ? bmp.height : bmp.width;
   const srcH = rotated ? bmp.width : bmp.height;
-  const scale = Math.min(1, 3200 / Math.max(srcW, srcH));
+  const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
   const w = Math.round(srcW * scale);
   const h = Math.round(srcH * scale);
   const canvas = document.createElement('canvas');
@@ -550,7 +555,7 @@ export async function prepareForService(file: File, rotation = 0): Promise<{ blo
   ctx.drawImage(bmp, (-bmp.width * scale) / 2, (-bmp.height * scale) / 2, bmp.width * scale, bmp.height * scale);
   bmp.close();
   const blob = await new Promise<Blob>((res, rej) =>
-    canvas.toBlob((b) => (b ? res(b) : rej(new Error('Could not encode image'))), 'image/jpeg', 0.95),
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error('Could not encode image'))), 'image/jpeg', quality),
   );
   return { blob, preview: canvas.toDataURL('image/jpeg', 0.8) };
 }

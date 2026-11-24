@@ -3,9 +3,10 @@ import {
   AlertTriangle, ArrowLeft, Check, ChevronDown, ChevronUp, ClipboardPaste, Copy, FileSpreadsheet, Image as ImageIcon, Loader2, RotateCw, ScanText, Trash2, Upload, X,
 } from 'lucide-react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { db, importSheetRows } from '../db';
+import { db, importSheetRows, replaceSheetImages } from '../db';
 import { AMOUNT_LABELS, normalizeName, parseAmount, type AmountField, type ImportRow } from '../lib/importTypes';
 import { parseSpreadsheet } from '../lib/parseSpreadsheet';
+import Magnifier from './Magnifier';
 import {
   ocrMemberSheet, ocrWithLocalService, OcrServiceUnavailable, prepareForService, preprocessImage, type OcrProgress, type OcrResult,
 } from '../lib/ocr';
@@ -306,6 +307,21 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
           referenceNumber: r.referenceNumber.trim(),
         })),
       );
+      // Keep the sheet photos for this group + day (upright, ≤2000px) so they can be shown
+      // beside the Day sheet. A new photo upload replaces the previous one for that day.
+      if (!sheet && images.length) {
+        try {
+          const stored = await Promise.all(
+            images.map(async (im) => ({
+              blob: (await prepareForService(im.file, im.rotation, 2000, 0.85)).blob,
+              name: im.file.name,
+            })),
+          );
+          await replaceSheetImages(groupId, date, stored);
+        } catch (e) {
+          console.error('Could not store sheet photos', e); // the import itself already succeeded
+        }
+      }
       onImported?.(result);
       onClose();
     } catch (e) {
@@ -428,9 +444,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
               {previews.length > 0 && (
                 <div className="space-y-3 lg:sticky lg:top-0 lg:max-h-[70vh] lg:overflow-auto">
                   {previews.map((p, i) => (
-                    <a key={i} href={p} target="_blank" rel="noreferrer" title="Open full size">
-                      <img src={p} alt={`Page ${i + 1}`} className="w-full rounded-lg border border-slate-200" />
-                    </a>
+                    <Magnifier key={i} src={p} alt={`Page ${i + 1}`} />
                   ))}
                   {rawText && (
                     <details className="text-xs text-slate-500">

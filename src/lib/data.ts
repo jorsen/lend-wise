@@ -1,6 +1,6 @@
 // Write helpers on top of the shared schema in src/db.ts (owned by the import/OCR side).
 // A member has at most one payment per date per channel.
-import { db, type Channel, type Group, type Member, type Payment } from '../db'
+import { db, type Channel, type DayCheck, type Group, type Member, type Payment } from '../db'
 
 export const CHANNELS: Channel[] = ['cash', 'client', 'agent']
 export const CHANNEL_LABEL: Record<Channel, string> = {
@@ -10,6 +10,41 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
 }
 
 const SEED_KEY = 'lendwise:seeded'
+
+// ---------- Sheet photos ----------
+
+/** A photo of the paper sheet, stored by the Upload dialog for one group and date. */
+export interface SheetImageRecord {
+  id?: number
+  groupId: number
+  date: string
+  blob: Blob
+  name: string
+  /** Degrees (0/90/180/270) to rotate when displaying. */
+  rotation: number
+  uploadedAt: number
+}
+
+/** The `sheetImages` table, or null on a database version that doesn't have it yet. */
+export function sheetImagesTable() {
+  return db.tables.some((t) => t.name === 'sheetImages') ? db.table<SheetImageRecord, number>('sheetImages') : null
+}
+
+const withImages = <T,>(tables: T[]) => {
+  const t = sheetImagesTable()
+  return t ? [...tables, t] : tables
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(r.error)
+    r.readAsDataURL(blob)
+  })
+}
+
+const dataUrlToBlob = async (url: string) => (await fetch(url)).blob()
 
 /** Creates the starter groups once, on a brand-new install. */
 export async function seedDefaultGroups() {
@@ -41,8 +76,10 @@ export async function addGroup(name: string) {
 export const renameGroup = (id: number, name: string) => db.groups.update(id, { name: name.trim() })
 
 export async function deleteGroup(id: number) {
-  await db.transaction('rw', db.groups, db.members, db.payments, async () => {
+  await db.transaction('rw', withImages([db.groups, db.members, db.payments, db.checks]), async () => {
+    await sheetImagesTable()?.where('groupId').equals(id).delete()
     await db.payments.where('groupId').equals(id).delete()
+    await db.checks.where('groupId').equals(id).delete()
     await db.members.where('groupId').equals(id).delete()
     await db.groups.delete(id)
   })
@@ -57,7 +94,7 @@ export async function addMember(groupId: number, cid: string, name: string) {
 }
 
 export async function updateMember(id: number, changes: { cid?: string; name?: string; groupId?: number }) {
-  await db.transaction('rw', db.members, db.payments, async () => {
+  await db.transaction('rw', db.members, db.payments, db.checks, async () => {
     const patch: Partial<Member> = {}
     if (changes.cid !== undefined) patch.cid = changes.cid.trim()
     if (changes.name !== undefined) patch.name = changes.name.trim().toUpperCase()
@@ -65,13 +102,15 @@ export async function updateMember(id: number, changes: { cid?: string; name?: s
     await db.members.update(id, patch)
     if (changes.groupId !== undefined) {
       await db.payments.where('memberId').equals(id).modify({ groupId: changes.groupId })
+      await db.checks.where('memberId').equals(id).modify({ groupId: changes.groupId })
     }
   })
 }
 
 export async function deleteMember(id: number) {
-  await db.transaction('rw', db.members, db.payments, async () => {
+  await db.transaction('rw', db.members, db.payments, db.checks, async () => {
     await db.payments.where('memberId').equals(id).delete()
+    await db.checks.where('memberId').equals(id).delete()
     await db.members.delete(id)
   })
 }
@@ -127,7 +166,11 @@ export async function setReference(member: Member, date: string, ref: string) {
 }
 
 export const clearDay = (groupId: number, date: string) =>
-  db.payments.where('[groupId+date]').equals([groupId, date]).delete()
+  db.transaction('rw', withImages([db.payments, db.checks]), async () => {
+    await sheetImagesTable()?.where('[groupId+date]').equals([groupId, date]).delete()
+    await db.checks.where('[groupId+date]').equals([groupId, date]).delete()
+    return db.payments.where('[groupId+date]').equals([groupId, date]).delete()
+  })
 
 export function sumByChannel(payments: Payment[]) {
   const t = { cash: 0, client: 0, agent: 0, total: 0 }
@@ -147,11 +190,22 @@ export interface BackupFile {
   groups: Group[]
   members: Member[]
   payments: Payment[]
+  /** Manual Status ticks; missing in backups made before they existed. */
+  checks?: DayCheck[]
+  /** Sheet photos with the image as a data: URL; missing in older backups. */
+  sheetImages?: (Omit<SheetImageRecord, 'blob'> & { dataUrl: string })[]
 }
 
 export async function exportBackup(): Promise<BackupFile> {
-  const [groups, members, payments] = await Promise.all([db.groups.toArray(), db.members.toArray(), db.payments.toArray()])
-  return { app: 'lend-wise', version: 2, exportedAt: new Date().toISOString(), groups, members, payments }
+  const [groups, members, payments, checks] = await Promise.all([
+    db.groups.toArray(),
+    db.members.toArray(),
+    db.payments.toArray(),
+    db.checks.toArray(),
+  ])
+  const images = (await sheetImagesTable()?.toArray()) ?? []
+  const sheetImages = await Promise.all(images.map(async ({ blob, ...rest }) => ({ ...rest, dataUrl: await blobToDataUrl(blob) })))
+  return { app: 'lend-wise', version: 2, exportedAt: new Date().toISOString(), groups, members, payments, checks, sheetImages }
 }
 
 export async function restoreBackup(data: unknown) {
@@ -159,11 +213,18 @@ export async function restoreBackup(data: unknown) {
   if (!b || b.app !== 'lend-wise' || !Array.isArray(b.groups) || !Array.isArray(b.members) || !Array.isArray(b.payments)) {
     throw new Error('This file is not a Lend-Wise backup.')
   }
-  await db.transaction('rw', db.groups, db.members, db.payments, async () => {
-    await Promise.all([db.groups.clear(), db.members.clear(), db.payments.clear()])
+  // Decode photos before the transaction: awaiting non-database work inside it would end it early.
+  const images: SheetImageRecord[] = await Promise.all(
+    (b.sheetImages ?? []).map(async ({ dataUrl, ...rest }) => ({ ...rest, blob: await dataUrlToBlob(dataUrl) })),
+  )
+  const imgTable = sheetImagesTable()
+  await db.transaction('rw', withImages([db.groups, db.members, db.payments, db.checks]), async () => {
+    await Promise.all([db.groups.clear(), db.members.clear(), db.payments.clear(), db.checks.clear(), imgTable?.clear()])
+    if (imgTable && images.length) await imgTable.bulkAdd(images)
     await db.groups.bulkAdd(b.groups!)
     await db.members.bulkAdd(b.members!)
     await db.payments.bulkAdd(b.payments!)
+    if (Array.isArray(b.checks)) await db.checks.bulkPut(b.checks)
   })
   return { groups: b.groups.length, members: b.members.length, payments: b.payments.length }
 }

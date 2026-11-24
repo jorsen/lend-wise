@@ -15,7 +15,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react'
-import { db, type Channel, type Group, type Member } from '../db'
+import { db, setChecked, type Channel, type Group, type Member } from '../db'
 import { clearDay, deleteGroup, deleteMember, sumByChannel } from '../lib/data'
 import { addDays, formatLongDate, formatPeso, formatRange, fromISODate, today, weekRange } from '../lib/format'
 import { downloadFile, toCSV } from '../lib/csv'
@@ -24,6 +24,7 @@ import { Button, ConfirmDialog, StatCard, cx, inputClass, selectClass, useToast 
 import { GroupDialog, MemberDialog, MemberHistoryDialog } from '../components/dialogs'
 import UploadMembersDialog from '../components/UploadMembersDialog'
 import { AmountCell } from '../components/AmountCell'
+import { SheetImagePanel } from '../components/SheetImagePanel'
 import { WeekGrid, type DayAmounts, type WeekRow } from './WeekGrid'
 
 type Sort = 'sheet' | 'name' | 'cid' | 'unpaid' | 'amount'
@@ -162,7 +163,7 @@ export function SaversPage({ group }: { group: Group }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  const exportCSV = () => {
+  const exportCSV = async () => {
     if (mode === 'week') {
       const dayHeads = weekDays.map((d) => fromISODate(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }))
       const data = [
@@ -177,6 +178,10 @@ export function SaversPage({ group }: { group: Group }) {
       downloadFile(`${group.name.replace(/\s+/g, '-')}_week_${weekStart}.csv`, toCSV(data))
       return
     }
+    // Status = the manual tick on the sheet (not whether an amount was entered)
+    const ticked = new Set(
+      (await db.checks.where('[groupId+date]').equals([groupId, date]).toArray()).filter((c) => c.checked).map((c) => c.memberId),
+    )
     const data = [
       ['No', 'CID', 'Member Name', 'Amount', 'Status', 'Channel', 'Reference #', 'Date'],
       ...visible.map((r, i) => [
@@ -184,7 +189,7 @@ export function SaversPage({ group }: { group: Group }) {
         r.member.cid,
         r.member.name,
         r.total || '',
-        r.total > 0 ? 'Paid' : 'Unpaid',
+        ticked.has(r.member.id!) ? 'Checked' : 'Not checked',
         COLS.filter((c) => r[c] > 0).map((c) => COL_LABEL[c]).join(' + '),
         r.ref,
         date,
@@ -356,7 +361,8 @@ export function SaversPage({ group }: { group: Group }) {
           }}
         />
       ) : (
-      <div ref={tableRef} className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden print-plain">
+      <div className="flex flex-col xl:flex-row gap-4 items-start">
+      <div ref={tableRef} className="w-full max-w-4xl shrink-0 rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden print-plain">
         <div className={cx('hidden md:grid gap-3 items-center px-4 py-2 border-b border-slate-200 text-sm font-medium text-slate-600', SHEET_COLS)}>
           <div>No</div>
           <div>Member Name</div>
@@ -401,6 +407,12 @@ export function SaversPage({ group }: { group: Group }) {
             }
           />
         ))}
+      </div>
+      {memberCount > 0 && (
+        <div className="w-full xl:flex-1 min-w-0 xl:sticky xl:top-4">
+          <SheetImagePanel groupId={groupId} date={date} onUpload={() => setUploadOpen(true)} />
+        </div>
+      )}
       </div>
       )}
 
@@ -467,7 +479,7 @@ export function SaversPage({ group }: { group: Group }) {
   )
 }
 
-const SHEET_COLS = 'md:grid-cols-[3rem_minmax(14rem,1fr)_10rem_8rem_5rem_5rem]'
+const SHEET_COLS = 'md:grid-cols-[3rem_minmax(12rem,20rem)_8rem_8rem_4.5rem_5rem]'
 
 function SheetRow({
   index,
@@ -487,7 +499,8 @@ function SheetRow({
   onDelete: () => void
 }) {
   const { member } = row
-  const paid = row.total > 0
+  // Status is ticked by hand (unticked by default), independent of the amount
+  const checked = useLiveQuery(() => db.checks.get([member.id!, date]).then((c) => !!c?.checked), [member.id, date]) ?? false
   const paidChannels = COLS.filter((c) => row[c] > 0)
   // Amounts typed on this sheet are recorded as cash. A member already paid through one
   // other channel (e.g. from an upload or the Week view) keeps editing that channel.
@@ -500,7 +513,7 @@ function SheetRow({
         'border-b border-slate-100 last:border-b-0 px-4 py-2.5 md:py-1 transition-colors',
         'grid grid-cols-[2rem_1fr_auto_auto] gap-x-3 gap-y-1 items-center',
         SHEET_COLS,
-        paid ? 'bg-emerald-50/40' : 'hover:bg-slate-50/60',
+        checked ? 'bg-emerald-50' : 'hover:bg-slate-50/60', // green only when Status is ticked
       )}
     >
       {/* No */}
@@ -539,20 +552,22 @@ function SheetRow({
         )}
       </div>
 
-      {/* Status: ticks itself when an amount is saved */}
+      {/* Status: unticked by default; tick it by hand after checking the member */}
       <div className="flex justify-center">
-        <span
+        <button
+          type="button"
           role="checkbox"
-          aria-checked={paid}
-          aria-label={paid ? 'Paid' : 'Not paid'}
-          title={paid ? 'Paid' : 'Not paid'}
+          aria-checked={checked}
+          aria-label={`Status for ${member.name}: ${checked ? 'checked' : 'not checked'}`}
+          title={checked ? 'Checked — click to untick' : 'Click to tick'}
+          onClick={() => setChecked(member.id!, member.groupId, date, !checked)}
           className={cx(
-            'h-5 w-5 rounded-[5px] border-2 grid place-items-center transition-colors',
-            paid ? 'bg-emerald-600 border-emerald-600 text-white' : 'border-slate-700 bg-white',
+            'h-5 w-5 rounded-[5px] border-2 grid place-items-center transition-colors cursor-pointer',
+            checked ? 'bg-emerald-600 border-emerald-600 text-white' : 'border-slate-700 bg-white hover:bg-slate-100',
           )}
         >
-          {paid && <Check size={14} strokeWidth={3} />}
-        </span>
+          {checked && <Check size={14} strokeWidth={3} />}
+        </button>
       </div>
 
       {/* Action */}

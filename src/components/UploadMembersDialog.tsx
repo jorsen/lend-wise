@@ -256,7 +256,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
   const membersSorted = useMemo(() => [...existing].sort((a, b) => a.name.localeCompare(b.name)), [existing]);
 
   const status = useMemo(() => {
-    if (!rows) return new Map<string, { label: string; tone: 'new' | 'update' | 'error' }>();
+    if (!rows) return new Map<string, { label: string; tone: 'new' | 'update' | 'warn' | 'error' }>();
     const byCid = new Map(existing.map((m) => [m.cid, m]));
     const memberUses = new Map<number, number>();
     const newCids = new Map<string, number>();
@@ -269,16 +269,16 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
       (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).some((f) => parseAmount(r[f]) == null);
     return new Map(
       rows.map((r) => {
-        let s: { label: string; tone: 'new' | 'update' | 'error' };
+        let s: { label: string; tone: 'new' | 'update' | 'warn' | 'error' };
         if (r.matchId != null) {
           if (r.include && (memberUses.get(r.matchId) ?? 0) > 1) s = { label: 'Same member twice', tone: 'error' };
-          else if (badAmount(r)) s = { label: 'Bad amount', tone: 'error' };
+          else if (badAmount(r)) s = { label: 'Amount skipped', tone: 'warn' };
           else s = { label: r.matchKind === 'cid' ? 'Update' : 'Matched', tone: 'update' };
         } else if (!/^\d{4,}$/.test(r.cid)) s = { label: 'Invalid CID', tone: 'error' };
         else if (!r.name.trim()) s = { label: 'Missing name', tone: 'error' };
         else if (byCid.has(r.cid)) s = { label: 'CID already used', tone: 'error' };
         else if (r.include && (newCids.get(r.cid) ?? 0) > 1) s = { label: 'Duplicate CID', tone: 'error' };
-        else if (badAmount(r)) s = { label: 'Bad amount', tone: 'error' };
+        else if (badAmount(r)) s = { label: 'Amount skipped', tone: 'warn' };
         else s = { label: 'New', tone: 'new' };
         return [r.key, s];
       }),
@@ -287,6 +287,11 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
 
   const included = rows?.filter((r) => r.include) ?? [];
   const blocking = included.filter((r) => status.get(r.key)?.tone === 'error').length;
+  // Unreadable amounts are left out (no payment for that channel); the row itself still imports
+  const skippedAmounts = included.reduce(
+    (n, r) => n + (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).filter((f) => parseAmount(r[f]) == null).length,
+    0,
+  );
   const totals = useMemo(() => {
     const t = { amountPaid: 0, clientInitiated: 0, agentAssisted: 0 };
     included.forEach((r) => (Object.keys(t) as AmountField[]).forEach((f) => (t[f] += parseAmount(r[f]) ?? 0)));
@@ -519,7 +524,13 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                         const lowConf = r.confidence != null && r.confidence < 70;
                         const cell = 'w-full rounded border border-transparent bg-transparent px-1.5 py-1 hover:border-slate-300 focus:border-emerald-500 focus:bg-white focus:outline-none';
                         const amt = (f: AmountField) => (
-                          <input className={`${cell} w-20 text-right ${parseAmount(r[f]) == null ? 'bg-red-50 text-red-700' : ''}`} value={r[f]} inputMode="decimal" onChange={(e) => update(r.key, { [f]: e.target.value })} />
+                          <input
+                            className={`${cell} w-20 text-right ${parseAmount(r[f]) == null ? 'bg-amber-50 text-amber-800 line-through decoration-amber-500' : ''}`}
+                            title={parseAmount(r[f]) == null ? 'Unreadable: not imported (fix it to include it)' : undefined}
+                            value={r[f]}
+                            inputMode="decimal"
+                            onChange={(e) => update(r.key, { [f]: e.target.value })}
+                          />
                         );
                         return (
                           <tr key={r.key} className={`border-t border-slate-100 ${!r.include ? 'opacity-40' : lowConf ? 'bg-amber-50/60' : ''}`}>
@@ -562,7 +573,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                             <td className="p-1"><input className={`${cell} w-24`} value={r.referenceNumber} onChange={(e) => update(r.key, { referenceNumber: e.target.value })} /></td>
                             <td className="p-2">
                               <span title={[...r.notes, r.confidence != null ? `OCR confidence ${r.confidence}%` : ''].filter(Boolean).join('\n')}
-                                className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${s.tone === 'error' ? 'bg-red-100 text-red-700' : s.tone === 'update' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                                className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${s.tone === 'error' ? 'bg-red-100 text-red-700' : s.tone === 'warn' ? 'bg-amber-100 text-amber-800' : s.tone === 'update' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>
                                 {s.label}
                                 {(r.notes.length > 0 || lowConf) && <AlertTriangle className="h-3 w-3 text-amber-600" />}
                               </span>
@@ -620,6 +631,11 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
               >
                 {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />} {copied ? 'Copied' : 'Copy table'}
               </button>
+              {skippedAmounts > 0 && (
+                <span className="text-sm text-amber-700">
+                  {skippedAmounts} unreadable amount{skippedAmounts === 1 ? '' : 's'} will be skipped
+                </span>
+              )}
               {blocking > 0 && <span className="text-sm text-red-600">{blocking} row(s) need fixing or unticking</span>}
               <button
                 className="flex items-center gap-2 rounded-lg bg-emerald-500 px-5 py-2.5 font-medium text-white hover:bg-emerald-600 disabled:opacity-50"

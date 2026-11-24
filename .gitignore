@@ -1,0 +1,9 @@
+node_modules
+dist
+public/tesseract
+*.local
+launcher/server.log
+launcher/server.pid
+.venv
+__pycache__
+*.tsbuildinfo

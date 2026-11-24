@@ -1,0 +1,169 @@
+// Write helpers on top of the shared schema in src/db.ts (owned by the import/OCR side).
+// A member has at most one payment per date per channel.
+import { db, type Channel, type Group, type Member, type Payment } from '../db'
+
+export const CHANNELS: Channel[] = ['cash', 'client', 'agent']
+export const CHANNEL_LABEL: Record<Channel, string> = {
+  cash: 'Cash',
+  client: 'Client initiated',
+  agent: 'Agent assisted',
+}
+
+const SEED_KEY = 'lendwise:seeded'
+
+/** Creates the starter groups once, on a brand-new install. */
+export async function seedDefaultGroups() {
+  try {
+    if (localStorage.getItem(SEED_KEY)) return
+  } catch {
+    /* storage blocked: rely on the count check */
+  }
+  // Inside a rw transaction so concurrent calls (e.g. StrictMode's double effect) can't both seed.
+  await db.transaction('rw', db.groups, async () => {
+    if ((await db.groups.count()) === 0) {
+      await db.groups.bulkAdd(['Santan 9', 'Santan 9B', 'Santan 3'].map((name, i) => ({ name, order: i }) as Group))
+    }
+  })
+  try {
+    localStorage.setItem(SEED_KEY, '1')
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---------- Groups ----------
+
+export async function addGroup(name: string) {
+  const last = await db.groups.orderBy('order').last()
+  return (await db.groups.add({ name: name.trim(), order: (last?.order ?? -1) + 1 } as Group)) as number
+}
+
+export const renameGroup = (id: number, name: string) => db.groups.update(id, { name: name.trim() })
+
+export async function deleteGroup(id: number) {
+  await db.transaction('rw', db.groups, db.members, db.payments, async () => {
+    await db.payments.where('groupId').equals(id).delete()
+    await db.members.where('groupId').equals(id).delete()
+    await db.groups.delete(id)
+  })
+}
+
+// ---------- Members ----------
+
+export async function addMember(groupId: number, cid: string, name: string) {
+  const existing = await db.members.where('groupId').equals(groupId).toArray()
+  const order = existing.reduce((m, x) => Math.max(m, x.order ?? 0), -1) + 1
+  return db.members.add({ groupId, cid: cid.trim(), name: name.trim().toUpperCase(), order } as Member)
+}
+
+export async function updateMember(id: number, changes: { cid?: string; name?: string; groupId?: number }) {
+  await db.transaction('rw', db.members, db.payments, async () => {
+    const patch: Partial<Member> = {}
+    if (changes.cid !== undefined) patch.cid = changes.cid.trim()
+    if (changes.name !== undefined) patch.name = changes.name.trim().toUpperCase()
+    if (changes.groupId !== undefined) patch.groupId = changes.groupId
+    await db.members.update(id, patch)
+    if (changes.groupId !== undefined) {
+      await db.payments.where('memberId').equals(id).modify({ groupId: changes.groupId })
+    }
+  })
+}
+
+export async function deleteMember(id: number) {
+  await db.transaction('rw', db.members, db.payments, async () => {
+    await db.payments.where('memberId').equals(id).delete()
+    await db.members.delete(id)
+  })
+}
+
+// ---------- Payments ----------
+
+/** Creates, updates or (amount <= 0) removes the member's payment for that date and channel. */
+export async function setPayment(member: Member, date: string, channel: Channel, amount: number) {
+  await db.transaction('rw', db.payments, async () => {
+    const existing = await db.payments
+      .where('[memberId+date]')
+      .equals([member.id!, date])
+      .filter((p) => p.channel === channel)
+      .toArray()
+    const [keep, ...dupes] = existing
+    if (dupes.length) await db.payments.bulkDelete(dupes.map((p) => p.id!))
+    if (!amount || amount <= 0) {
+      if (keep) await db.payments.delete(keep.id!)
+      return
+    }
+    const rounded = Math.round(amount * 100) / 100
+    if (keep) await db.payments.update(keep.id!, { amount: rounded })
+    else
+      await db.payments.add({
+        groupId: member.groupId,
+        memberId: member.id!,
+        date,
+        channel,
+        amount: rounded,
+        referenceNumber: '',
+      } as Payment)
+  })
+}
+
+/** Moves a member's payment for that date from one channel to another (adding to any amount already there). */
+export async function moveChannel(member: Member, date: string, from: Channel, to: Channel) {
+  if (from === to) return
+  await db.transaction('rw', db.payments, async () => {
+    const ps = await db.payments.where('[memberId+date]').equals([member.id!, date]).toArray()
+    const src = ps.filter((p) => p.channel === from)
+    if (!src.length) return
+    const amount = src.reduce((s, p) => s + p.amount, 0)
+    const dst = ps.find((p) => p.channel === to)
+    await db.payments.bulkDelete(src.map((p) => p.id!))
+    if (dst) await db.payments.update(dst.id!, { amount: Math.round((dst.amount + amount) * 100) / 100 })
+    else await db.payments.add({ ...src[0], id: undefined, channel: to, amount } as Payment)
+  })
+}
+
+export async function setReference(member: Member, date: string, ref: string) {
+  const ps = await db.payments.where('[memberId+date]').equals([member.id!, date]).toArray()
+  await Promise.all(ps.map((p) => db.payments.update(p.id!, { referenceNumber: ref.trim() })))
+}
+
+export const clearDay = (groupId: number, date: string) =>
+  db.payments.where('[groupId+date]').equals([groupId, date]).delete()
+
+export function sumByChannel(payments: Payment[]) {
+  const t = { cash: 0, client: 0, agent: 0, total: 0 }
+  for (const p of payments) {
+    t[p.channel] += p.amount
+    t.total += p.amount
+  }
+  return t
+}
+
+// ---------- Backup ----------
+
+export interface BackupFile {
+  app: 'lend-wise'
+  version: 2
+  exportedAt: string
+  groups: Group[]
+  members: Member[]
+  payments: Payment[]
+}
+
+export async function exportBackup(): Promise<BackupFile> {
+  const [groups, members, payments] = await Promise.all([db.groups.toArray(), db.members.toArray(), db.payments.toArray()])
+  return { app: 'lend-wise', version: 2, exportedAt: new Date().toISOString(), groups, members, payments }
+}
+
+export async function restoreBackup(data: unknown) {
+  const b = data as Partial<BackupFile>
+  if (!b || b.app !== 'lend-wise' || !Array.isArray(b.groups) || !Array.isArray(b.members) || !Array.isArray(b.payments)) {
+    throw new Error('This file is not a Lend-Wise backup.')
+  }
+  await db.transaction('rw', db.groups, db.members, db.payments, async () => {
+    await Promise.all([db.groups.clear(), db.members.clear(), db.payments.clear()])
+    await db.groups.bulkAdd(b.groups!)
+    await db.members.bulkAdd(b.members!)
+    await db.payments.bulkAdd(b.payments!)
+  })
+  return { groups: b.groups.length, members: b.members.length, payments: b.payments.length }
+}

@@ -6,7 +6,9 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db, importSheetRows } from '../db';
 import { AMOUNT_LABELS, normalizeName, parseAmount, type AmountField, type ImportRow } from '../lib/importTypes';
 import { parseSpreadsheet } from '../lib/parseSpreadsheet';
-import { ocrMemberSheet, preprocessImage, type OcrProgress } from '../lib/ocr';
+import {
+  ocrMemberSheet, ocrWithLocalService, OcrServiceUnavailable, prepareForService, preprocessImage, type OcrProgress, type OcrResult,
+} from '../lib/ocr';
 
 interface Props {
   open: boolean;
@@ -64,6 +66,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
   const [dragOver, setDragOver] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [fallbackUsed, setFallbackUsed] = useState(false);
 
   useEffect(() => {
     if (!open) reset();
@@ -181,16 +184,29 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
         const urls: string[] = [];
         let text = '';
         let detected = true;
+        let usedFallback = false;
         for (const [idx, img] of images.entries()) {
           const page = `Page ${idx + 1}`;
           setBusy({ status: 'Preparing image', progress: 0, page });
-          const canvas = await preprocessImage(img.file, img.rotation);
-          urls.push(canvas.toDataURL('image/jpeg', 0.85));
-          const res = await ocrMemberSheet(canvas, {
-            defaultColumn,
-            source: page,
-            onProgress: (p) => setBusy({ ...p, page }),
-          });
+          let res: OcrResult;
+          try {
+            // Accurate engine: local RapidOCR service with ruling-line table detection
+            const { blob, preview } = await prepareForService(img.file, img.rotation);
+            setBusy({ status: 'Reading the sheet (about 15–30 s per page)', progress: 0.3, page });
+            res = await ocrWithLocalService(blob, page);
+            urls.push(preview);
+          } catch (e) {
+            if (!(e instanceof OcrServiceUnavailable)) throw e;
+            // Fallback: in-browser Tesseract (much less accurate)
+            usedFallback = true;
+            const canvas = await preprocessImage(img.file, img.rotation);
+            urls.push(canvas.toDataURL('image/jpeg', 0.85));
+            res = await ocrMemberSheet(canvas, {
+              defaultColumn,
+              source: page,
+              onProgress: (p) => setBusy({ ...p, page }),
+            });
+          }
           all.push(...res.rows);
           text += `--- ${page} ---\n${res.rawText}\n`;
           detected &&= res.columnsDetected;
@@ -204,6 +220,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
         setPreviews(urls);
         setRawText(text);
         setColumnsDetected(detected);
+        setFallbackUsed(usedFallback);
       }
     } catch (e) {
       console.error(e);
@@ -226,7 +243,9 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
         notes.push(`CID corrected ${cid || '(blank)'} → ${m.cid} (name match)`);
         cid = m.cid;
       }
-      if (byCid.has(cid) && !name) name = byCid.get(cid)!.name;
+      const saved = byCid.get(cid);
+      // OCR often drops spaces ("BENILDAV.MARQUEZ"); prefer the saved spelling when only spacing differs
+      if (saved && (!name || normalizeName(name) === normalizeName(saved.name))) name = saved.name;
       return { ...r, cid, name, notes };
     });
   }
@@ -423,6 +442,15 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
               )}
 
               <div className="min-w-0">
+                {previews.length > 0 && fallbackUsed && (
+                  <div className="mb-3 flex items-start gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      The accurate OCR engine isn't running, so basic in-browser OCR was used and results will be poor.
+                      Restart the app (it starts the engine automatically), or run <code>npm run ocr</code>.
+                    </span>
+                  </div>
+                )}
                 {previews.length > 0 && !columnsDetected && (
                   <div className="mb-3 flex items-center gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
                     <AlertTriangle className="h-4 w-4" /> Column headers weren't found, so amounts were placed in "{AMOUNT_LABELS[defaultColumn]}".
@@ -465,7 +493,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                           <tr key={r.key} className={`border-t border-slate-100 ${!r.include ? 'opacity-40' : lowConf ? 'bg-amber-50/60' : ''}`}>
                             <td className="p-2"><input type="checkbox" checked={r.include} onChange={(e) => update(r.key, { include: e.target.checked })} /></td>
                             <td className="p-2 text-slate-400">{i + 1}</td>
-                            <td className="p-1"><input className={`${cell} w-28 font-mono`} value={r.cid} onChange={(e) => update(r.key, { cid: e.target.value.replace(/\D/g, '') })} /></td>
+                            <td className="p-1"><input className={`${cell} !w-28 min-w-28 font-mono`} value={r.cid} onChange={(e) => update(r.key, { cid: e.target.value.replace(/\D/g, '') })} /></td>
                             <td className="p-1"><input className={`${cell} min-w-44`} value={r.name} onChange={(e) => update(r.key, { name: e.target.value })} /></td>
                             <td className="p-1">{amt('amountPaid')}</td>
                             <td className="p-1">{amt('clientInitiated')}</td>

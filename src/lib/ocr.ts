@@ -524,3 +524,89 @@ export async function terminateOcr() {
     workerPromise = null;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Accurate OCR: local RapidOCR service (ocr-server/server.py)         */
+/* ------------------------------------------------------------------ */
+
+/** Applies EXIF orientation + rotation and returns a colour JPEG (long side ≤ 3200px) plus a preview URL. */
+export async function prepareForService(file: File, rotation = 0): Promise<{ blob: Blob; preview: string }> {
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const rotated = rotation % 180 !== 0;
+  const srcW = rotated ? bmp.height : bmp.width;
+  const srcH = rotated ? bmp.width : bmp.height;
+  const scale = Math.min(1, 3200 / Math.max(srcW, srcH));
+  const w = Math.round(srcW * scale);
+  const h = Math.round(srcH * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate((rotation * Math.PI) / 180);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, (-bmp.width * scale) / 2, (-bmp.height * scale) / 2, bmp.width * scale, bmp.height * scale);
+  bmp.close();
+  const blob = await new Promise<Blob>((res, rej) =>
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error('Could not encode image'))), 'image/jpeg', 0.95),
+  );
+  return { blob, preview: canvas.toDataURL('image/jpeg', 0.8) };
+}
+
+interface ServiceRow {
+  cid: string;
+  name: string;
+  amountPaid: string;
+  clientInitiated: string;
+  agentAssisted: string;
+  referenceNumber: string;
+  confidence: number;
+  notes: string[];
+}
+
+export class OcrServiceUnavailable extends Error {}
+
+/**
+ * Sends a page to the local OCR service (RapidOCR + ruling-line table detection).
+ * Throws OcrServiceUnavailable if the service isn't running, so callers can fall back.
+ */
+export async function ocrWithLocalService(blob: Blob, source: string): Promise<OcrResult> {
+  let resp: Response;
+  try {
+    resp = await fetch(`${import.meta.env.BASE_URL}api/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: blob,
+    });
+  } catch {
+    throw new OcrServiceUnavailable('OCR service not reachable');
+  }
+  // Vite's proxy answers 502/504 (or 500 with an HTML body) when the service is down
+  const isJson = resp.headers.get('content-type')?.includes('application/json');
+  if (!isJson || resp.status === 502 || resp.status === 503 || resp.status === 504) {
+    throw new OcrServiceUnavailable(`OCR service unavailable (${resp.status})`);
+  }
+  const data = (await resp.json()) as {
+    rows?: ServiceRow[];
+    columnsDetected?: boolean;
+    text?: string;
+    error?: string;
+  };
+  if (!resp.ok) throw new Error(data.error || `OCR failed (${resp.status})`);
+  const rows = (data.rows ?? []).map((r) =>
+    newRow({
+      cid: r.cid,
+      name: r.name,
+      amountPaid: r.amountPaid,
+      clientInitiated: r.clientInitiated,
+      agentAssisted: r.agentAssisted,
+      referenceNumber: r.referenceNumber,
+      confidence: r.confidence,
+      notes: r.notes ?? [],
+      source,
+    }),
+  );
+  return { rows, rawText: data.text ?? '', columnsDetected: !!data.columnsDetected };
+}

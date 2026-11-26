@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, importSheetRows, replaceSheetImages } from '../db';
-import { AMOUNT_LABELS, normalizeName, parseAmount, type AmountField, type ImportRow } from '../lib/importTypes';
+import { AMOUNT_LABELS, isKyc, isUnreadableAmount, normalizeName, parseAmount, type AmountField, type ImportRow } from '../lib/importTypes';
 import { parseSpreadsheet } from '../lib/parseSpreadsheet';
 import Magnifier from './Magnifier';
 import { matchSheet } from '../lib/memberMatch';
@@ -58,7 +58,8 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
   const inputRef = useRef<HTMLInputElement>(null);
   const [images, setImages] = useState<PickedImage[]>([]);
   const [sheet, setSheet] = useState<File | null>(null);
-  const [defaultColumn, setDefaultColumn] = useState<AmountField>('agentAssisted');
+  // When the photo's column headers can't be read, amounts always go to Agent Assisted.
+  const defaultColumn: AmountField = 'agentAssisted';
   const [busy, setBusy] = useState<OcrProgress & { page?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<ImportRow[] | null>(null);
@@ -263,10 +264,10 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
     rows.forEach((r) => {
       if (!r.include) return;
       if (r.matchId != null) memberUses.set(r.matchId, (memberUses.get(r.matchId) ?? 0) + 1);
-      else newCids.set(r.cid, (newCids.get(r.cid) ?? 0) + 1);
+      else if (r.cid.trim()) newCids.set(r.cid.trim(), (newCids.get(r.cid.trim()) ?? 0) + 1);
     });
     const badAmount = (r: ImportRow) =>
-      (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).some((f) => parseAmount(r[f]) == null);
+      (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).some((f) => isUnreadableAmount(f, r[f]));
     return new Map(
       rows.map((r) => {
         let s: { label: string; tone: 'new' | 'update' | 'warn' | 'error' };
@@ -274,8 +275,10 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
           if (r.include && (memberUses.get(r.matchId) ?? 0) > 1) s = { label: 'Same member twice', tone: 'error' };
           else if (badAmount(r)) s = { label: 'Amount skipped', tone: 'warn' };
           else s = { label: r.matchKind === 'cid' ? 'Update' : 'Matched', tone: 'update' };
-        } else if (!/^\d{4,}$/.test(r.cid)) s = { label: 'Invalid CID', tone: 'error' };
-        else if (!r.name.trim()) s = { label: 'Missing name', tone: 'error' };
+        } else if (!r.name.trim()) s = { label: 'Missing name', tone: 'error' };
+        // No CID is allowed: the person is saved by name and the CID can be added later from their profile.
+        else if (!r.cid.trim()) s = badAmount(r) ? { label: 'No CID · amount skipped', tone: 'warn' } : { label: 'New · no CID', tone: 'new' };
+        else if (!/^\d{4,}$/.test(r.cid.trim())) s = { label: 'Invalid CID', tone: 'error' };
         else if (byCid.has(r.cid)) s = { label: 'CID already used', tone: 'error' };
         else if (r.include && (newCids.get(r.cid) ?? 0) > 1) s = { label: 'Duplicate CID', tone: 'error' };
         else if (badAmount(r)) s = { label: 'Amount skipped', tone: 'warn' };
@@ -289,7 +292,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
   const blocking = included.filter((r) => status.get(r.key)?.tone === 'error').length;
   // Unreadable amounts are left out (no payment for that channel); the row itself still imports
   const skippedAmounts = included.reduce(
-    (n, r) => n + (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).filter((f) => parseAmount(r[f]) == null).length,
+    (n, r) => n + (['amountPaid', 'clientInitiated', 'agentAssisted'] as const).filter((f) => isUnreadableAmount(f, r[f])).length,
     0,
   );
   const totals = useMemo(() => {
@@ -321,12 +324,12 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
           memberId: r.matchId ?? undefined,
           // only an exact-CID link may refresh the stored name; fuzzy/manual links never overwrite it
           fuzzy: r.matchId != null && r.matchKind !== 'cid',
-          cid: r.cid,
+          cid: r.cid.trim(),
           name: r.name.trim().toUpperCase(),
           cash: parseAmount(r.amountPaid) ?? 0,
           client: parseAmount(r.clientInitiated) ?? 0,
           agent: parseAmount(r.agentAssisted) ?? 0,
-          referenceNumber: r.referenceNumber.trim(),
+          referenceNumber: r.referenceNumber.trim().toUpperCase(),
         })),
       );
       // Keep the sheet photos for this group + day (upright, ≤2000px) so they can be shown
@@ -358,8 +361,8 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
   const hasFiles = !!sheet || images.length > 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 no-print" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
-      <div className={`relative flex max-h-[95vh] w-full flex-col rounded-xl bg-white shadow-2xl ${reviewing ? 'max-w-7xl' : 'max-w-2xl'}`}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-2 sm:p-4 no-print">
+      <div className={`relative flex max-h-[95vh] w-full flex-col rounded-xl bg-white shadow-2xl ${reviewing ? 'max-w-none' : 'max-w-2xl'}`}>
         <button className="absolute right-4 top-4 rounded p-1 text-slate-500 hover:bg-slate-100" onClick={onClose} disabled={!!busy} aria-label="Close">
           <X className="h-5 w-5" />
         </button>
@@ -439,12 +442,6 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                       </div>
                     ))}
                   </div>
-                  <label className="mt-4 flex flex-wrap items-center gap-2 text-sm text-slate-700">
-                    If column headers can't be read, put amounts in:
-                    <select className="rounded-md border border-slate-300 px-2 py-1" value={defaultColumn} onChange={(e) => setDefaultColumn(e.target.value as AmountField)}>
-                      {(Object.keys(AMOUNT_LABELS) as AmountField[]).map((f) => <option key={f} value={f}>{AMOUNT_LABELS[f]}</option>)}
-                    </select>
-                  </label>
                 </>
               )}
 
@@ -525,8 +522,8 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                         const cell = 'w-full rounded border border-transparent bg-transparent px-1.5 py-1 hover:border-slate-300 focus:border-emerald-500 focus:bg-white focus:outline-none';
                         const amt = (f: AmountField) => (
                           <input
-                            className={`${cell} w-20 text-right ${parseAmount(r[f]) == null ? 'bg-amber-50 text-amber-800 line-through decoration-amber-500' : ''}`}
-                            title={parseAmount(r[f]) == null ? 'Unreadable: not imported (fix it to include it)' : undefined}
+                            className={`${cell} w-20 text-right ${isUnreadableAmount(f, r[f]) ? 'bg-amber-50 text-amber-800 line-through decoration-amber-500' : f === 'agentAssisted' && isKyc(r[f]) ? 'bg-violet-50 font-semibold text-violet-700' : ''}`}
+                            title={isUnreadableAmount(f, r[f]) ? 'Unreadable: not imported (fix it to include it)' : f === 'agentAssisted' && isKyc(r[f]) ? 'KYC: accepted, no amount recorded' : undefined}
                             value={r[f]}
                             inputMode="decimal"
                             onChange={(e) => update(r.key, { [f]: e.target.value })}
@@ -537,7 +534,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                             <td className="p-2"><input type="checkbox" checked={r.include} onChange={(e) => update(r.key, { include: e.target.checked })} /></td>
                             <td className="p-2 text-slate-400">{i + 1}</td>
                             <td className="p-1"><input className={`${cell} !w-28 min-w-28 font-mono`} value={r.cid} onChange={(e) => update(r.key, { cid: e.target.value.replace(/\D/g, '') })} /></td>
-                            <td className="p-1"><input className={`${cell} min-w-44`} value={r.name} onChange={(e) => update(r.key, { name: e.target.value })} /></td>
+                            <td className="p-1"><input className={`${cell} min-w-44`} value={r.name} onChange={(e) => update(r.key, { name: e.target.value.toUpperCase() })} /></td>
                             <td className="p-1">
                               <select
                                 className={`max-w-56 rounded border px-1.5 py-1 text-xs ${r.matchId != null ? (r.matchKind === 'cid' ? 'border-blue-200 bg-blue-50 text-blue-800' : 'border-amber-300 bg-amber-50 text-amber-900') : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}
@@ -570,7 +567,7 @@ export default function UploadMembersDialog({ open, onClose, groupId, date, onIm
                             <td className="p-1">{amt('amountPaid')}</td>
                             <td className="p-1">{amt('clientInitiated')}</td>
                             <td className="p-1">{amt('agentAssisted')}</td>
-                            <td className="p-1"><input className={`${cell} w-24`} value={r.referenceNumber} onChange={(e) => update(r.key, { referenceNumber: e.target.value })} /></td>
+                            <td className="p-1"><input className={`${cell} w-24`} value={r.referenceNumber} onChange={(e) => update(r.key, { referenceNumber: e.target.value.toUpperCase() })} /></td>
                             <td className="p-2">
                               <span title={[...r.notes, r.confidence != null ? `OCR confidence ${r.confidence}%` : ''].filter(Boolean).join('\n')}
                                 className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${s.tone === 'error' ? 'bg-red-100 text-red-700' : s.tone === 'warn' ? 'bg-amber-100 text-amber-800' : s.tone === 'update' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>

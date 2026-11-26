@@ -113,9 +113,12 @@ export async function importSheetRows(groupId: number, date: string, rows: Sheet
     let nextOrder = existing.reduce((m, x) => Math.max(m, x.order), -1) + 1;
 
     for (const r of rows) {
+      // A blank CID never looks anyone up: otherwise every no-CID row would land on the same member.
       let member = r.memberId != null
         ? await db.members.get(r.memberId)
-        : await db.members.where('[groupId+cid]').equals([groupId, r.cid]).first();
+        : r.cid.trim()
+          ? await db.members.where('[groupId+cid]').equals([groupId, r.cid.trim()]).first()
+          : undefined;
       if (member && member.groupId !== groupId) member = undefined; // safety: never cross groups
       if (member) {
         if (!r.fuzzy && r.name && r.name !== member.name) await db.members.update(member.id!, { name: r.name });

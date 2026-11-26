@@ -67,6 +67,13 @@ export function parseAmount(raw: string): number | null {
   return Number(fixed);
 }
 
+/** "KYC" written in the Agent Assisted column (any case, spacing or trailing dot). */
+export const isKyc = (raw: string) => /^k\s*y\s*c\.?$/i.test(raw.trim());
+
+/** True when a cell can't be imported: not a number, and not an accepted marker like KYC for agent assisted. */
+export const isUnreadableAmount = (field: AmountField, raw: string) =>
+  parseAmount(raw) == null && !(field === 'agentAssisted' && isKyc(raw));
+
 export function normalizeName(name: string): string {
   return name.toUpperCase().replace(/[^A-ZÑ]/g, '');
 }

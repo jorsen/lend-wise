@@ -109,7 +109,7 @@ export function MemberDialog({
           <input id="member-cid" autoFocus className={inputClass} value={cid} onChange={(e) => setCid(e.target.value)} placeholder="1010059398" inputMode="numeric" />
         </Field>
         <Field label="Member name">
-          <input className={inputClass + ' uppercase'} value={name} onChange={(e) => setName(e.target.value)} placeholder="Juan D. Dela Cruz" />
+          <input className={inputClass} value={name} onChange={(e) => setName(e.target.value.toUpperCase())} placeholder="JUAN D. DELA CRUZ" />
         </Field>
         <Field label="Group">
           <select className={inputClass} value={targetGroup} onChange={(e) => setTargetGroup(Number(e.target.value))}>
